@@ -7,7 +7,7 @@ OUTPUT_FILE  <- file.path(DATA_DIR, "hail_mesh_60min.parquet")
 LOG_FILE     <- file.path(DATA_DIR, "build_log.csv")
 
 START_DATE   <- as.Date("2021-01-01")
-N_WORKERS    <- 4L
+N_WORKERS    <- 6L
 RETRY_MAX    <- 3L
 MESH_MIN     <- 0        # keep only mesh_mm > MESH_MIN
 MESH_MISSING <- c(-999, -99, -1, -3)  # MRMS sentinel values to exclude

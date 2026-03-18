@@ -93,78 +93,57 @@ empty_mesh_tibble <- function() {
 }
 
 parse_grib <- function(gz_path, valid_time) {
-  # Reads a .grib2.gz file, returns tibble of non-zero hail pixels.
-  # Tries GDAL /vsigzip/ first; falls back to manual gunzip on Windows.
+  # Reads a .grib2.gz via GDAL /vsigzip/ virtual filesystem (no temp decompression).
+  # Fast extraction: values() + which() + xyFromCell() avoids materializing
+  # 24.5M coordinate pairs for the full CONUS grid.
 
-  r <- tryCatch(terra::rast(gz_path), error = function(e) NULL)
-
-  # Fallback: manually decompress then read
-  # NOTE: terra is lazy — rast() only opens the file; values are read during
-  # as.data.frame(). Do NOT delete the decompressed file until after extraction.
-  grib_path <- NULL
-  if (is.null(r)) {
-    grib_path <- sub("\\.gz$", "", gz_path)
-    R.utils::gunzip(gz_path, destname = grib_path, overwrite = TRUE, remove = FALSE)
-    r <- tryCatch(terra::rast(grib_path), error = function(e) NULL)
-  }
+  r <- tryCatch(
+    terra::rast(paste0("/vsigzip/", gz_path)),
+    error = function(e) NULL
+  )
 
   if (is.null(r)) {
-    if (!is.null(grib_path) && fs::file_exists(grib_path)) fs::file_delete(grib_path)
     cli::cli_warn("Could not read grib2 for {valid_time}")
     return(empty_mesh_tibble())
   }
 
-  df <- terra::as.data.frame(r, xy = TRUE)
+  vals <- terra::values(r, mat = FALSE)
+  idx  <- which(!is.na(vals) & vals > MESH_MIN & !(vals %in% MESH_MISSING))
 
-  # Safe to delete decompressed file now that data is in memory
-  if (!is.null(grib_path) && fs::file_exists(grib_path)) fs::file_delete(grib_path)
+  if (length(idx) == 0L) return(empty_mesh_tibble())
 
-  # Positional rename: x, y, <layer_name> -> lon, lat, mesh_mm
-  names(df) <- c("lon", "lat", "mesh_mm")
+  xy <- terra::xyFromCell(r, idx)
 
-  df <- df |>
-    dplyr::filter(
-      !is.na(mesh_mm),
-      !(mesh_mm %in% MESH_MISSING),
-      mesh_mm > MESH_MIN
-    ) |>
-    dplyr::mutate(valid_time = valid_time) |>
-    dplyr::select(valid_time, lon, lat, mesh_mm) |>
-    tibble::as_tibble()
-
-  df
+  tibble::tibble(
+    valid_time = valid_time,
+    lon        = xy[, 1L],
+    lat        = xy[, 2L],
+    mesh_mm    = vals[idx]
+  )
 }
 
 # ----------------------------------------------------------------------------
 # Per-hour processing
 # ----------------------------------------------------------------------------
 
-process_one_hour <- function(valid_time, temp_dir = tempdir()) {
-  # End-to-end: download one file, parse, return results + metadata.
-  # Returns: list($data, $status, $nrows, $size_kb)
+process_one_hour <- function(valid_time, out_dir = tempdir()) {
+  # Download, parse, and write result to a per-hour parquet in out_dir.
+  # Returns only small metadata (no data over IPC) to avoid furrr socket overhead.
+  # Returns: list($path, $status, $nrows, $size_kb)
 
-  url   <- make_url(valid_time)
-  fname <- basename(url)
-  dest  <- file.path(temp_dir, fname)
+  url      <- make_url(valid_time)
+  fname    <- basename(url)
+  dest     <- file.path(out_dir, fname)
+  ts_key   <- format(valid_time, "%Y%m%d%H", tz = "UTC")
+  out_path <- file.path(out_dir, paste0(ts_key, ".parquet"))
 
   dl <- download_grib(url, dest)
 
   if (isFALSE(dl)) {
-    return(list(
-      data    = empty_mesh_tibble(),
-      status  = "missing",
-      nrows   = 0L,
-      size_kb = NA_real_
-    ))
+    return(list(path = NA_character_, status = "missing", nrows = 0L, size_kb = NA_real_))
   }
-
   if (is.na(dl)) {
-    return(list(
-      data    = empty_mesh_tibble(),
-      status  = "error",
-      nrows   = 0L,
-      size_kb = NA_real_
-    ))
+    return(list(path = NA_character_, status = "error",   nrows = 0L, size_kb = NA_real_))
   }
 
   size_kb <- as.numeric(fs::file_size(dest)) / 1024
@@ -179,12 +158,13 @@ process_one_hour <- function(valid_time, temp_dir = tempdir()) {
 
   if (fs::file_exists(dest)) fs::file_delete(dest)
 
-  list(
-    data    = df,
-    status  = "ok",
-    nrows   = nrow(df),
-    size_kb = size_kb
-  )
+  if (nrow(df) > 0L) {
+    arrow::write_parquet(df, out_path)
+  } else {
+    out_path <- NA_character_
+  }
+
+  list(path = out_path, status = "ok", nrows = nrow(df), size_kb = size_kb)
 }
 
 # ----------------------------------------------------------------------------
@@ -239,18 +219,30 @@ append_build_log <- function(new_entries) {
 
 process_chunk <- function(timestamps, chunk_label) {
   # Parallel-processes a vector of timestamps.
+  # Workers write per-hour parquets to a temp dir; only small metadata crosses IPC.
   # Returns: list($data = tibble, $log = tibble)
 
   cli::cli_alert_info("Processing chunk: {chunk_label} ({length(timestamps)} hours)")
 
+  hour_dir <- fs::dir_create(file.path(tempdir(), paste0("mrms_", gsub("[^A-Za-z0-9]", "_", chunk_label))))
+
+  show_progress <- interactive()
   results <- furrr::future_map(
     timestamps,
     process_one_hour,
-    .options = furrr::furrr_options(seed = TRUE),
-    .progress = TRUE
+    out_dir   = hour_dir,
+    .options  = furrr::furrr_options(seed = TRUE),
+    .progress = show_progress
   )
 
-  data_df <- purrr::map_dfr(results, "data")
+  # Read per-hour parquets and bind (only files that exist)
+  paths   <- purrr::map_chr(results, "path")
+  valid   <- paths[!is.na(paths) & fs::file_exists(paths)]
+  data_df <- if (length(valid) > 0) purrr::map_dfr(valid, arrow::read_parquet) else empty_mesh_tibble()
+
+  # Clean up temp hour parquets (GC first to release Windows file handles)
+  gc(verbose = FALSE)
+  tryCatch(fs::dir_delete(hour_dir), error = function(e) NULL)
 
   log_df <- tibble::tibble(
     valid_time = timestamps,
