@@ -122,13 +122,18 @@ Rscript build_dataset.R
    month and appends to the build log — **safe to interrupt and resume**
 5. Combines all chunks into `data/hail_mesh_60min.parquet`
 
-**Performance** (12-core / 20-logical-core machine, 6 workers):
+**Performance** (12-core / 20-logical-thread machine, 6 workers, ~100 Mbps):
 
-| Scope | Files | Wall time |
-|-------|-------|-----------|
-| 1 week | 189 hours | ~2 min |
-| 1 month | ~744 hours | ~8 min |
-| Full build (5 years) | ~43,800 hours | ~8 hours |
+| Scope | Hours of data | Wall time |
+|-------|--------------|-----------|
+| 1 day | 24 | ~16 seconds |
+| 1 week | 168 | ~2 minutes |
+| 1 month | ~720 | ~8 minutes |
+| **Full 5-year build** | **45,671** | **~8.5 hours** |
+
+Throughput: **~0.67 seconds per hour-of-data** (6 parallel workers).
+The bottleneck is `terra::values()` reading 98 MB of uncompressed raster
+per file — memory bandwidth bound, not network bound.
 
 **Resume:** If the build is interrupted, re-run `build_dataset.R`. It reads
 the build log and skips all previously completed hours, resuming from where
@@ -153,6 +158,20 @@ Run this on a schedule (daily, hourly, etc.) to bring the dataset current.
 4. Appends new rows to the main Parquet
 5. Writes `data/delta/hail_mesh_delta_YYYYMMDD_HHMMSS.parquet` containing
    **only the new rows** from this run (for SQL workflows — see below)
+
+**Expected run time:**
+
+| Update window | Processing | Parquet I/O | Total |
+|---------------|------------|-------------|-------|
+| 1 hour | ~1 sec | ~40–60 sec | ~1 min |
+| 1 day (24 hrs) | ~16 sec | ~40–60 sec | **~1–2 min** |
+| 1 week (catch-up) | ~2 min | ~40–60 sec | ~3 min |
+
+The parquet I/O cost (reading the full dataset + writing it back) is
+roughly constant regardless of how many new hours are added — it reflects
+the size of the existing dataset (~1–2 GB at 5 years). For frequent
+updates, consider switching to DuckDB or appending directly to a database
+rather than rewriting the full Parquet each run.
 
 ### 3. Quick smoke test
 
