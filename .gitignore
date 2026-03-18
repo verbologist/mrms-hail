@@ -1,5 +1,7 @@
 # Data outputs (large files, not tracked)
 data/
+# except delta dir listing is tracked so the folder exists
+!data/delta/.gitkeep
 
 # R session artifacts
 .Rhistory

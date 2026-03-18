@@ -8,7 +8,9 @@
 #   1. Finds the most recent timestamp in the existing parquet
 #   2. Fetches all new top-of-hour files up to the current UTC hour
 #   3. Retries any previously "missing" or "error" timestamps (gap fill)
-#   4. Appends new rows to the parquet and updates the build log
+#   4. Appends new rows to the main parquet and updates the build log
+#   5. Writes a delta parquet of only the new rows for SQL INSERT workflows
+#      -> data/delta/hail_mesh_delta_YYYYMMDD_HHMMSS.parquet
 #
 # Prerequisite: build_dataset.R must have been run at least once.
 # ============================================================================
@@ -20,7 +22,10 @@ source("R/utils.R")
 # 0. Setup
 # ----------------------------------------------------------------------------
 
+DELTA_DIR <- file.path(DATA_DIR, "delta")
+
 ensure_dirs()
+fs::dir_create(DELTA_DIR)
 future::plan(future::multisession, workers = N_WORKERS)
 on.exit(future::plan(future::sequential), add = TRUE)
 
@@ -107,18 +112,32 @@ if (nrow(result$data) > 0) {
     cli::cli_alert_info("Removed {length(retry_times)} retry-timestamp slots from existing data")
   }
 
-  combined <- dplyr::bind_rows(existing_data, result$data) |>
+  new_data <- result$data |>
     dplyr::filter(mesh_mm > MESH_MIN) |>
     dplyr::arrange(valid_time, lat, lon)
 
+  combined <- dplyr::bind_rows(existing_data, new_data) |>
+    dplyr::arrange(valid_time, lat, lon)
+
+  # Write updated main parquet
   arrow::write_parquet(combined, OUTPUT_FILE)
-  new_rows <- nrow(combined) - nrow(existing_data) + length(retry_times)
   cli::cli_alert_success(
-    "Parquet updated: {nrow(combined)} total rows (+{nrow(result$data)} new hail pixels)"
+    "Main parquet updated: {nrow(combined)} total rows (+{nrow(new_data)} new hail pixels)"
   )
+
+  # Write delta parquet for SQL INSERT (new rows only, timestamped filename)
+  delta_ts   <- format(lubridate::now("UTC"), "%Y%m%d_%H%M%S")
+  delta_file <- file.path(DELTA_DIR, paste0("hail_mesh_delta_", delta_ts, ".parquet"))
+  arrow::write_parquet(new_data, delta_file)
+  cli::cli_alert_success(
+    "Delta parquet written: {basename(delta_file)} ({nrow(new_data)} rows)"
+  )
+
 } else {
   cli::cli_alert_warning("No new hail data found in update window (all hours had zero pixels or were missing).")
-  combined <- existing_data
+  combined  <- existing_data
+  new_data  <- empty_mesh_tibble()
+  delta_file <- NA_character_
 }
 
 # ----------------------------------------------------------------------------
@@ -142,12 +161,13 @@ updated_log <- read_build_log()
 cli::cli_h1("Update Summary")
 cli::cli_bullets(c(
   "v" = "Hours processed:  {length(all_update_times)}",
-  "v" = "New hail rows:    {nrow(result$data)}",
+  "v" = "New hail rows:    {nrow(new_data)}",
   "v" = "Gaps filled:      {gaps_filled} of {length(retry_times)} retried",
   "!" = "Still missing:    {n_missing}",
   "x" = "Errors:           {n_error}",
   "i" = "Total log entries:{nrow(updated_log)}",
-  "i" = "Elapsed:          {elapsed} minutes"
+  "i" = "Elapsed:          {elapsed} minutes",
+  "i" = "Delta file:       {if (!is.na(delta_file)) basename(delta_file) else 'none (no new data)'}"
 ))
 
 cli::cli_alert_info(
