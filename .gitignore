@@ -1,0 +1,12 @@
+# Data outputs (large files, not tracked)
+data/
+
+# R session artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj.user
+
+# Temp files
+*.tmp
+*.log
