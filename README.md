@@ -62,17 +62,19 @@ hour produces 5,000–50,000 rows; a quiet winter hour may produce fewer than
 ```
 mrms-hail/
 ├── R/
-│   ├── config.R            # All constants (paths, URLs, worker count)
-│   ├── utils.R             # Core functions (download, parse, chunk, log)
-│   └── install_packages.R  # One-time CRAN package setup
-├── build_dataset.R         # Full historical build (2021 – present)
-├── update_dataset.R        # Incremental updater with gap-fill + delta output
-├── test_last_week.R        # Quick smoke test: last 7 days only
-├── data/                   # Created at runtime, not tracked in git
-│   ├── hail_mesh_60min.parquet   # Full dataset (main output)
-│   ├── build_log.csv             # Per-hour status log
-│   ├── chunks/                   # Monthly intermediate parquets (build only)
-│   └── delta/                    # Per-run delta parquets for SQL INSERT
+│   ├── config.R              # All constants (paths, URLs, worker count)
+│   ├── utils.R               # Core functions (download, parse, chunk, log)
+│   └── install_packages.R    # One-time CRAN package setup
+├── build_dataset.R           # Full historical build (2021 – present)
+├── update_dataset.R          # Incremental updater with gap-fill + delta output
+├── build_grid_lookup.R       # One-time: map every grid cell to state/county
+├── test_last_week.R          # Quick smoke test: last 7 days only
+├── data/                     # Created at runtime, not tracked in git
+│   ├── hail_mesh_60min.parquet     # Full hail dataset (main output)
+│   ├── grid_county_lookup.parquet  # Grid cell → county mapping (one-time build)
+│   ├── build_log.csv               # Per-hour status log
+│   ├── chunks/                     # Monthly intermediate parquets (build only)
+│   └── delta/                      # Per-run delta parquets for SQL INSERT
 └── mrms-hail.Rproj
 ```
 
@@ -173,7 +175,64 @@ the size of the existing dataset (~1–2 GB at 5 years). For frequent
 updates, consider switching to DuckDB or appending directly to a database
 rather than rewriting the full Parquet each run.
 
-### 3. Quick smoke test
+### 3. Grid county lookup (one-time)
+
+```r
+source("build_grid_lookup.R")
+```
+
+Builds `data/grid_county_lookup.parquet` — a static mapping of every MRMS
+grid cell to its US county. Run once after the initial build; the lookup
+never changes unless you regenerate it with updated Census boundaries.
+
+**What it does:**
+
+1. Downloads US county and state boundaries from the Census Bureau via
+   `tigris` (cached locally after first download)
+2. Rasterizes the county polygons directly onto the 7,000 × 3,500 MRMS
+   grid using `terra::rasterize()` — assigns each 1 km cell its county FIPS
+3. Drops ocean and outside-CONUS cells (≈ 40% of the grid)
+4. Joins full county/state attributes and writes Parquet
+
+**Output schema:**
+
+| Column | Example |
+|--------|---------|
+| `lon` | -97.53 |
+| `lat` | 35.47 |
+| `fips` | "40109" |
+| `state_fips` | "40" |
+| `county_fips` | "109" |
+| `state_name` | "Oklahoma" |
+| `state_abbr` | "OK" |
+| `county_name` | "Oklahoma" |
+
+**Performance:** ~10–20 minutes (rasterize dominates). Output ~150–250 MB.
+Run once; result is static.
+
+**Join with hail data:**
+
+```r
+hail <- arrow::read_parquet("data/hail_mesh_60min.parquet")
+lkp  <- arrow::read_parquet("data/grid_county_lookup.parquet")
+
+hail_counties <- dplyr::left_join(hail, lkp, by = c("lon", "lat"))
+```
+
+**Top hail counties:**
+
+```r
+hail_counties |>
+  dplyr::group_by(state_abbr, county_name, fips) |>
+  dplyr::summarise(
+    max_mesh_mm = max(mesh_mm),
+    hail_hours  = dplyr::n_distinct(valid_time),
+    .groups     = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(max_mesh_mm))
+```
+
+### 4. Quick smoke test
 
 ```r
 source("test_last_week.R")

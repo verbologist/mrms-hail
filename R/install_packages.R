@@ -14,7 +14,9 @@ cran_pkgs <- c(
   "readr",       # CSV read/write
   "purrr",       # functional programming
   "tibble",      # tibble construction
-  "R.utils"      # gunzip fallback for grib2.gz on Windows
+  "R.utils",     # gunzip fallback for grib2.gz on Windows
+  "tigris",      # US Census county/state boundaries (grid lookup)
+  "sf"           # spatial operations (grid lookup)
 )
 
 to_install <- cran_pkgs[!vapply(cran_pkgs, requireNamespace, logical(1), quietly = TRUE)]
