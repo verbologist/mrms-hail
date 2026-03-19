@@ -207,8 +207,11 @@ never changes unless you regenerate it with updated Census boundaries.
 | `state_abbr` | "OK" |
 | `county_name` | "Oklahoma" |
 
-**Performance:** ~10–20 minutes (rasterize dominates). Output ~150–250 MB.
+**Performance:** ~30 seconds (terra rasterize is highly optimized). Output **13 MB**.
 Run once; result is static.
+
+**Coverage:** 8.2M land cells across 3,109 counties in 49 states/DC
+(33.5% of the 24.5M grid — remaining 66.5% is ocean or outside CONUS).
 
 **Join with hail data:**
 

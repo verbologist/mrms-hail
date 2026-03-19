@@ -117,16 +117,12 @@ cli::cli_alert_success(
 
 cli::cli_alert_info("Rasterizing county polygons onto MRMS grid (this takes ~10-15 min)...")
 
-counties_vect  <- terra::vect(counties_sf) |>
-  terra::set.values(counties_attr$idx, field = "idx")
-
-# Re-attach idx to the SpatVector via a clean merge
-counties_vect2 <- terra::vect(
+counties_vect <- terra::vect(
   counties_sf |> dplyr::mutate(idx = dplyr::row_number())
 )
 
 t_rast <- Sys.time()
-grid_idx <- terra::rasterize(counties_vect2, mrms_grid, field = "idx")
+grid_idx <- terra::rasterize(counties_vect, mrms_grid, field = "idx")
 cli::cli_alert_success(
   "Rasterize complete in {round(difftime(Sys.time(), t_rast, units='mins'), 1)} min"
 )
