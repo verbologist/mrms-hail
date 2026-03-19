@@ -58,10 +58,19 @@ if (length(remaining) == 0) {
     cli::cli_alert_info("Final parquet missing -- combining chunks...")
     chunk_files <- fs::dir_ls(CHUNK_DIR, glob = "*.parquet")
     if (length(chunk_files) > 0) {
-      all_data <- purrr::map_dfr(chunk_files, arrow::read_parquet) |>
-        dplyr::arrange(valid_time, lat, lon)
-      arrow::write_parquet(all_data, OUTPUT_FILE)
-      cli::cli_alert_success("Written: {OUTPUT_FILE} ({nrow(all_data)} rows)")
+      con        <- duckdb::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+      chunk_glob <- fs::path(CHUNK_DIR, "*.parquet")
+      DBI::dbExecute(con, sprintf("
+        COPY (
+          SELECT valid_time, lon, lat, mesh_mm
+          FROM read_parquet('%s')
+          WHERE mesh_mm > %s
+          ORDER BY valid_time, lat, lon
+        ) TO '%s' (FORMAT PARQUET, CODEC 'SNAPPY')
+      ", chunk_glob, MESH_MIN, fs::path_abs(OUTPUT_FILE)))
+      duckdb::dbDisconnect(con, shutdown = TRUE)
+      n_rows <- arrow::read_parquet(OUTPUT_FILE, col_select = "valid_time") |> nrow()
+      cli::cli_alert_success("Written: {OUTPUT_FILE} ({n_rows} rows)")
     }
   }
 
@@ -113,19 +122,29 @@ for (month_key in names(month_groups)) {
 }
 
 # ----------------------------------------------------------------------------
-# 5. Combine all chunks into final output
+# 5. Combine all chunks into final output via DuckDB (streaming, no OOM)
 # ----------------------------------------------------------------------------
 
 cli::cli_h2("Combining chunks into final parquet")
 
 chunk_files <- fs::dir_ls(CHUNK_DIR, glob = "*.parquet")
-cli::cli_alert_info("Reading {length(chunk_files)} chunk files...")
+cli::cli_alert_info("Combining {length(chunk_files)} chunk files via DuckDB...")
 
-all_data <- purrr::map_dfr(chunk_files, arrow::read_parquet) |>
-  dplyr::filter(mesh_mm > MESH_MIN) |>  # extra safety filter
-  dplyr::arrange(valid_time, lat, lon)
+con        <- duckdb::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+chunk_glob <- fs::path(CHUNK_DIR, "*.parquet")
 
-arrow::write_parquet(all_data, OUTPUT_FILE)
+DBI::dbExecute(con, sprintf("
+  COPY (
+    SELECT valid_time, lon, lat, mesh_mm
+    FROM read_parquet('%s')
+    WHERE mesh_mm > %s
+    ORDER BY valid_time, lat, lon
+  ) TO '%s' (FORMAT PARQUET, CODEC 'SNAPPY')
+", chunk_glob, MESH_MIN, fs::path_abs(OUTPUT_FILE)))
+
+duckdb::dbDisconnect(con, shutdown = TRUE)
+
+all_data <- arrow::read_parquet(OUTPUT_FILE)  # for row count in summary
 
 # ----------------------------------------------------------------------------
 # 6. Summary
